@@ -1,0 +1,7 @@
+tensorflow
+pandas
+scikit-learn
+matplotlib
+Flask
+Pillow
+h5py
