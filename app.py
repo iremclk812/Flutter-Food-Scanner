@@ -5,6 +5,7 @@ import pandas as pd
 import tensorflow as tf
 from flask import Flask, request, jsonify
 from PIL import Image
+import google.generativeai as genai
 
 # --- Initialize Flask App ---
 app = Flask(__name__)
@@ -12,46 +13,51 @@ app = Flask(__name__)
 # --- Constants ---
 IMG_SIZE = (224, 224)
 MODEL_PATH = 'food_classifier.keras'
-CSV_PATH = 'merge.csv'  # This is the single source of all data
+CSV_PATH = os.path.join('archive', 'nutrition.csv') # Use the actual nutrition data source
 
 # --- Global Variables ---
 model = None
 label_map = None
 nutrition_df = None
 
+# --- Gemini API Configuration ---
+# IMPORTANT: Replace "YOUR_API_KEY" with your actual Google AI Studio API key.
+# For better security, it's recommended to load the key from an environment variable.
+API_KEY = 'AIzaSyAxR1QTQT7KH31-JNKJ_Iz1LPTN5f3JNfE' 
+genai.configure(api_key=API_KEY)
+
+
 def load_model_and_data():
-    """Loads the Keras model, labels, and all nutrition data from merge.csv."""
+    """Loads the Keras model and nutrition data, creating the label map directly."""
     global model, label_map, nutrition_df
-    
+
+    # 1. Load the Keras model
     print("Loading Keras model...")
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
     model = tf.keras.models.load_model(MODEL_PATH)
     print("Model loaded successfully.")
 
-    print(f"Loading all data from {CSV_PATH}...")
+    # 2. Load nutrition data from the source CSV
+    print(f"Loading nutrition data from {CSV_PATH}...")
     if not os.path.exists(CSV_PATH):
         raise FileNotFoundError(f"CSV file not found at {CSV_PATH}")
     
     df = pd.read_csv(CSV_PATH)
-    
-    # 1. Create label mapping for the model's output
-    # This uses the 'label' column to create a map from number to category name
-    df['label_cat'] = df['label'].astype('category').cat.codes
-    label_map = dict(enumerate(df['label'].astype('category').cat.categories))
-    print("Labels loaded successfully.")
+    # Standardize column name to 'label' to match training logic
+    df.rename(columns={'Name': 'label'}, inplace=True)
 
-    # 2. Create the nutrition lookup table from the same CSV
-    # Dynamically determine nutrition columns by excluding known non-nutrition columns
-    all_columns = df.columns.tolist()
-    non_nutrition_cols = ['label', 'image_path', 'weight', 'label_cat']
-    nutrition_cols = [col for col in all_columns if col not in non_nutrition_cols]
-    
-    # The columns for the final dataframe will be the label + all nutrition columns
-    lookup_cols = ['label'] + nutrition_cols
-            
-    nutrition_df = df[lookup_cols].drop_duplicates(subset=['label']).set_index('label')
-    print("Nutrition lookup table created successfully with all available nutrition columns.")
+    # 3. Create the label map based on alphabetical order of unique labels
+    # This is critical because the model was trained with labels sorted alphabetically
+    # (as implicitly done by `astype('category').cat.categories` in train_cnn.py)
+    unique_labels = sorted(df['label'].unique())
+    label_map = {i: label for i, label in enumerate(unique_labels)}
+    print(f"Label map created successfully with {len(label_map)} classes.")
+
+    # 4. Create the nutrition lookup table
+    # Use the first entry for each food type as the definitive nutrition source
+    nutrition_df = df.drop_duplicates(subset=['label']).set_index('label')
+    print("Nutrition lookup table created successfully.")
     print("Columns included:", nutrition_df.columns.tolist())
     print("Nutrition data preview:")
     print(nutrition_df.head())
@@ -86,17 +92,47 @@ def predict():
         confidence = float(np.max(predictions[0]))
         predicted_class_name = label_map[predicted_class_index]
         
-        # Get nutrition info using the predicted class name as the key
+        gemini_suggestion = None
+        # If confidence is below 40%, ask Gemini for a second opinion
+        if confidence < 0.40:
+            try:
+                print("Confidence below 40%, querying Gemini...")
+                # Use the gemini-1.5-flash model for speed and cost-effectiveness
+                gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+                
+                # Prepare the image for Gemini
+                img_for_gemini = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+                
+                # Send the image and prompt to Gemini
+                response = gemini_model.generate_content(["What food is in this image? Provide only the name of the food.", img_for_gemini])
+                
+                # Clean up the response to get just the food name
+                gemini_suggestion = response.text.strip()
+                print(f"Gemini suggestion: {gemini_suggestion}")
+
+            except Exception as gemini_e:
+                print(f"An error occurred with Gemini API: {gemini_e}")
+                # If Gemini fails, we still proceed without its suggestion
+                gemini_suggestion = "Error: Could not get suggestion."
+
+        # Get nutrition info using the original predicted class name as the key
         if predicted_class_name in nutrition_df.index:
             nutrition_info = nutrition_df.loc[predicted_class_name].to_dict()
         else:
             nutrition_info = {}
 
-        return jsonify({
+        # Prepare the final JSON response
+        response_data = {
             'prediction': predicted_class_name,
             'confidence': f'{confidence:.2%}',
             'nutrition': nutrition_info
-        })
+        }
+
+        # Add Gemini's suggestion to the response if it exists
+        if gemini_suggestion:
+            response_data['gemini_suggestion'] = gemini_suggestion
+
+        return jsonify(response_data)
 
     except Exception as e:
         print(f"An error occurred: {e}") # Log the error for debugging
